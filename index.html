@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Form Fill</title>
+<!-- pdf-lib 1.17.1, hosted next to this page so it works offline -->
+<script src="pdf-lib.min.js"></script>
+<style>
+  :root { font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif; color: #1a1a1a; }
+  body { margin: 0; padding: 16px; max-width: 900px; margin-inline: auto; }
+  h1 { font-size: 1.2rem; margin: 0 0 12px; }
+  .status { padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; background: #f1f3f5; }
+  .status.ok { background: #e6f4ea; }
+  .status.err { background: #fde8e8; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  button, a.btn { font: inherit; padding: 12px 16px; border-radius: 8px; border: 0; background: #1f4e79;
+                  color: #fff; text-decoration: none; cursor: pointer; }
+  button[disabled] { opacity: .4; }
+  iframe { width: 100%; height: 70vh; border: 1px solid #ccc; border-radius: 8px; }
+  details { margin-top: 12px; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  td, th { border-bottom: 1px solid #eee; padding: 4px 6px; text-align: left; vertical-align: top; }
+  code { background: #f1f3f5; padding: 1px 4px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1 id="title">PDF Form Fill</h1>
+<div id="status" class="status">Loading…</div>
+<div class="buttons">
+  <button id="share" disabled>Share / Print</button>
+  <a id="open" class="btn" target="_blank" hidden>Open PDF</a>
+  <a id="download" class="btn" hidden>Download</a>
+</div>
+<iframe id="preview" title="PDF preview" hidden></iframe>
+<details id="report" hidden>
+  <summary>Field report</summary>
+  <div id="reportBody"></div>
+</details>
+
+<script>
+/*
+  Usage:
+    index.html?form=template#Summons_No=12-0042&Site_Name=Acme&Served_In_Person=yes
+
+  - form      : template file name without .pdf (same folder). Default: "template".
+  - flatten   : 1 (default) locks the fields; 0 leaves them editable.
+  - filename  : name for the output file. Default: <form>_<Summons_No or timestamp>.pdf
+  Every other parameter is matched 1:1 to a PDF form field with exactly the same name.
+  Parameters can go after ? or #. Values after # stay on the device (never sent to the server).
+*/
+const RESERVED = new Set(['form', 'flatten', 'filename']);
+
+// Editing only the part after # does not reload the page, so the old PDF would stay on screen.
+// Reload whenever the # values change so the PDF is always built from the current link.
+window.addEventListener('hashchange', () => location.reload());
+const TRUE_VALUES = new Set(['1', 'true', 'yes', 'y', 'on', 'x', 'checked']);
+
+function readParams() {
+  const params = new Map();
+  const add = (s) => new URLSearchParams(s).forEach((v, k) => params.set(k, v));
+  add(location.search.slice(1));
+  add(location.hash.slice(1));          // # wins over ? when both are given
+  return params;
+}
+
+function setStatus(msg, cls = '') {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status ' + cls;
+}
+
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// pdf-lib's flatten() can leave page /Annots pointing at deleted widget objects,
+// which some PDF readers report as a damaged file. Drop those references.
+function removeDanglingAnnots(doc) {
+  const { PDFName, PDFArray, PDFRef } = PDFLib;
+  for (const page of doc.getPages()) {
+    const annots = page.node.lookupMaybe(PDFName.of('Annots'), PDFArray);
+    if (!annots) continue;
+    const kept = annots.asArray().filter(a => !(a instanceof PDFRef) || doc.context.lookup(a) !== undefined);
+    if (kept.length) page.node.set(PDFName.of('Annots'), doc.context.obj(kept));
+    else page.node.delete(PDFName.of('Annots'));
+  }
+}
+
+async function fillPdf(templateBytes, values, { flatten = true } = {}) {
+  const { PDFDocument, StandardFonts, PDFTextField, PDFCheckBox, PDFDropdown,
+          PDFRadioGroup, PDFOptionList } = PDFLib;
+  const doc = await PDFDocument.load(templateBytes);
+  const form = doc.getForm();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+
+  const fields = new Map(form.getFields().map(f => [f.getName(), f]));
+  const byLower = new Map([...fields.keys()].map(n => [n.toLowerCase(), n]));
+  const report = { filled: [], unknownParams: [], notProvided: [], errors: [], caseFixed: [] };
+  const used = new Set();
+
+  for (const [rawName, value] of values) {
+    let name = rawName;
+    if (!fields.has(name) && byLower.has(name.trim().toLowerCase())) {
+      name = byLower.get(name.trim().toLowerCase());      // forgive case/whitespace, but report it
+      report.caseFixed.push([rawName, name]);
+    }
+    const field = fields.get(name);
+    if (!field) { report.unknownParams.push(rawName); continue; }
+    used.add(name);
+    try {
+      if (field instanceof PDFTextField) {
+        field.setText(value);
+      } else if (field instanceof PDFCheckBox) {
+        TRUE_VALUES.has(value.trim().toLowerCase()) ? field.check() : field.uncheck();
+      } else if (field instanceof PDFDropdown || field instanceof PDFOptionList) {
+        field.select(value);
+      } else if (field instanceof PDFRadioGroup) {
+        field.select(value);
+      } else {
+        throw new Error('unsupported field type ' + field.constructor.name);
+      }
+      report.filled.push([name, value, field.constructor.name.replace('PDF', '')]);
+    } catch (e) {
+      report.errors.push([name, value, e.message]);
+    }
+  }
+  for (const name of fields.keys()) {
+    if (!used.has(name)) report.notProvided.push(name);
+  }
+
+  form.updateFieldAppearances(font);
+  if (flatten) {
+    form.flatten();
+    removeDanglingAnnots(doc);
+  }
+  return { bytes: await doc.save(), report, fieldNames: [...fields.keys()] };
+}
+
+function renderReport(r, fieldNames) {
+  const rows = (arr, cols) => arr.length
+    ? `<table><tr>${cols.map(c => `<th>${c}</th>`).join('')}</tr>${
+        arr.map(a => `<tr>${[].concat(a).map(x => `<td>${esc(x)}</td>`).join('')}</tr>`).join('')}</table>`
+    : '<p>None</p>';
+  document.getElementById('reportBody').innerHTML = `
+    <h3>Filled (${r.filled.length})</h3>${rows(r.filled, ['Field', 'Value', 'Type'])}
+    <h3>Errors (${r.errors.length})</h3>${rows(r.errors, ['Field', 'Value', 'Error'])}
+    <h3>Name case corrected (${r.caseFixed.length})</h3>${rows(r.caseFixed, ['In link', 'Matched field'])}
+    <h3>Link parameters with no matching field (${r.unknownParams.length})</h3>${rows(r.unknownParams, ['Parameter'])}
+    <h3>Template fields not in link (${r.notProvided.length})</h3>${rows(r.notProvided, ['Field'])}
+    <h3>All template field names</h3><p>${fieldNames.map(n => `<code>${esc(n)}</code>`).join(' ')}</p>`;
+  document.getElementById('report').hidden = false;
+}
+
+// Offline support: the service worker (sw.js) keeps a copy of this page, pdf-lib and the templates on the device.
+async function registerOffline() {
+  if (!('serviceWorker' in navigator)) return null;
+  try { await navigator.serviceWorker.register('sw.js'); return await navigator.serviceWorker.ready; }
+  catch (e) { console.warn('Service worker not registered', e); return null; }
+}
+
+// Opened with no values (e.g. the morning "Start my day" link): check that everything is stored for offline use.
+async function readinessCheck(form) {
+  setStatus('Checking offline readiness…');
+  const sw = await registerOffline();
+  if (!sw) { setStatus('Offline use NOT available in this browser (no service worker). Needs HTTPS.', 'err'); return; }
+  const needed = ['index.html', 'pdf-lib.min.js', `${form}.pdf`];
+  const missing = [];
+  for (const f of needed) {
+    try { const r = await fetch(f, { cache: 'reload' }); if (!r.ok) missing.push(f); }  // fetching through the worker stores it
+    catch { if (!(await caches.match(f, { ignoreSearch: true }))) missing.push(f); }
+  }
+  const cached = [];
+  for (const f of needed) if (await caches.match(f, { ignoreSearch: true })) cached.push(f);
+  if (missing.length || cached.length < needed.length) {
+    setStatus(`NOT READY. Missing: ${needed.filter(f => !cached.includes(f)).join(', ')}. Connect and open this page again.`, 'err');
+  } else {
+    setStatus(`READY for offline use. Stored: ${cached.join(', ')} (checked ${new Date().toLocaleString()})`, 'ok');
+  }
+}
+
+(async () => {
+  try {
+    const params = readParams();
+    const form = (params.get('form') || 'template').replace(/[^A-Za-z0-9_-]/g, '');
+    const flatten = params.get('flatten') !== '0';
+    const values = new Map([...params].filter(([k]) => !RESERVED.has(k)));
+    if (values.size === 0) { document.getElementById('title').textContent = 'Print page: offline check'; return readinessCheck(form); }
+    registerOffline();   // keep the stored copy fresh in the background
+
+    document.getElementById('title').textContent = `PDF Form Fill: ${form}`;
+    setStatus(`Loading template ${form}.pdf…`);
+
+    const resp = await fetch(`${form}.pdf`);
+    if (!resp.ok) throw new Error(`Template "${form}.pdf" not found (HTTP ${resp.status})`);
+    const { bytes, report, fieldNames } = await fillPdf(await resp.arrayBuffer(), values, { flatten });
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const fileName = (params.get('filename') ||
+      `${form}_${values.get('Summons_No') || stamp}`).replace(/[^A-Za-z0-9_.-]/g, '_') + '.pdf';
+    const file = new File([bytes], fileName, { type: 'application/pdf' });
+    const url = URL.createObjectURL(file);
+
+    const preview = document.getElementById('preview');
+    preview.src = url; preview.hidden = false;
+    const open = document.getElementById('open'); open.href = url; open.hidden = false;
+    const dl = document.getElementById('download'); dl.href = url; dl.download = fileName; dl.hidden = false;
+
+    const share = document.getElementById('share');
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      share.disabled = false;
+      share.onclick = () => navigator.share({ files: [file], title: fileName }).catch(() => {});
+    } else {
+      share.textContent = 'Share / Print (not supported here, use Open PDF)';
+    }
+
+    renderReport(report, fieldNames);
+    const problems = report.unknownParams.length + report.errors.length;
+    let msg = `${fileName}: ${report.filled.length} field(s) filled` + (flatten ? '' : ' (not flattened)');
+    if (report.unknownParams.length) msg += `. No matching field for: ${report.unknownParams.join(', ')}`;
+    if (report.errors.length) msg += `. Errors in: ${report.errors.map(e => e[0]).join(', ')}`;
+    if (report.caseFixed.length) msg += `. Case corrected: ${report.caseFixed.map(c => c[0]).join(', ')}`;
+    if (problems) msg += '. See Field report for valid names.';
+    setStatus(msg, problems ? 'err' : 'ok');
+    if (problems) document.getElementById('report').open = true;
+  } catch (e) {
+    console.error(e);
+    setStatus('Error: ' + e.message, 'err');
+  }
+})();
+</script>
+</body>
+</html>
